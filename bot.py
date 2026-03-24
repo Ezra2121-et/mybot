@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import warnings
+import httpx
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup
@@ -10,8 +11,6 @@ from telegram.ext import (
     CallbackQueryHandler, ConversationHandler, ContextTypes, filters
 )
 from telegram.warnings import PTBUserWarning
-from database import db
-from github_handler import get_git_data  # Create separate file for GitHub handler
 
 # Configure logging
 logging.basicConfig(
@@ -20,42 +19,230 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress warnings
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
+# Load environment variables
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not TOKEN:
-    raise ValueError("TELEGRAM_TOKEN not found")
+    raise ValueError("❌ TELEGRAM_TOKEN not found in .env file!")
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL not found")
+    raise ValueError("❌ DATABASE_URL not found in .env file!")
+
+# Database import
+import asyncpg
+
+# Database connection pool
+db_pool = None
 
 # Constants for State Machine
 NAME, URL, CONFIRM, GET_GIT_USER, EDIT_PROJECT, EDIT_FIELD, DELETE_PROJECT_CONFIRM = range(7)
 
+# Store active timers
 active_timers = {}
-start_time = datetime.now()
 
 def escape_markdown(text):
     """Escape special characters for Markdown"""
     special_chars = r'_*[]()~`>#+-=|{}.!'
     return ''.join(f'\\{char}' if char in special_chars else char for char in str(text))
 
-# --- Main Menu & Start ---
+# ============= DATABASE FUNCTIONS =============
+
+async def init_db():
+    """Initialize database connection and create tables"""
+    global db_pool
+    try:
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=2,
+            max_size=10,
+            command_timeout=60
+        )
+        
+        # Create tables
+        async with db_pool.acquire() as conn:
+            # Users table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username VARCHAR(255),
+                    first_name VARCHAR(255),
+                    last_name VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Projects table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS projects (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                    name VARCHAR(500) NOT NULL,
+                    url TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Pomodoro sessions table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS pomodoro_sessions (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                    start_time TIMESTAMP,
+                    end_time TIMESTAMP,
+                    duration INTEGER,
+                    completed BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            logger.info("✅ Database tables created/verified")
+        
+        logger.info("✅ Database connected successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        return False
+
+async def get_or_create_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    """Get user or create if doesn't exist"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT * FROM users WHERE user_id = $1', user_id)
+        
+        if row:
+            await conn.execute('UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = $1', user_id)
+            return dict(row)
+        else:
+            await conn.execute('''
+                INSERT INTO users (user_id, username, first_name, last_name)
+                VALUES ($1, $2, $3, $4)
+            ''', user_id, username, first_name, last_name)
+            
+            row = await conn.fetchrow('SELECT * FROM users WHERE user_id = $1', user_id)
+            return dict(row)
+
+async def add_project(user_id: int, name: str, url: str) -> bool:
+    """Add a new project"""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO projects (user_id, name, url) VALUES ($1, $2, $3)',
+                user_id, name, url
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Error adding project: {e}")
+        return False
+
+async def get_projects(user_id: int):
+    """Get all projects for a user"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            'SELECT * FROM projects WHERE user_id = $1 ORDER BY created_at DESC',
+            user_id
+        )
+        return [dict(row) for row in rows]
+
+async def update_project(project_id: int, user_id: int, name: str = None, url: str = None) -> bool:
+    """Update a project"""
+    try:
+        async with db_pool.acquire() as conn:
+            if name:
+                await conn.execute('''
+                    UPDATE projects SET name = $1, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $2 AND user_id = $3
+                ''', name, project_id, user_id)
+            elif url:
+                await conn.execute('''
+                    UPDATE projects SET url = $1, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $2 AND user_id = $3
+                ''', url, project_id, user_id)
+            return True
+    except Exception as e:
+        logger.error(f"Error updating project: {e}")
+        return False
+
+async def delete_project(project_id: int, user_id: int) -> bool:
+    """Delete a project"""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute('DELETE FROM projects WHERE id = $1 AND user_id = $2', project_id, user_id)
+            return True
+    except Exception as e:
+        logger.error(f"Error deleting project: {e}")
+        return False
+
+async def add_pomodoro_session(user_id: int, start_time, end_time, duration, completed=False):
+    """Log Pomodoro session"""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO pomodoro_sessions (user_id, start_time, end_time, duration, completed)
+                VALUES ($1, $2, $3, $4, $5)
+            ''', user_id, start_time, end_time, duration, completed)
+    except Exception as e:
+        logger.error(f"Error adding Pomodoro session: {e}")
+
+# ============= GITHUB FUNCTIONS =============
+
+async def get_git_data(username):
+    """Fetch GitHub user data"""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            # Get latest pushed repo
+            r = await client.get(
+                f"https://api.github.com/users/{username}/repos",
+                params={"sort": "pushed", "per_page": 1}
+            )
+            
+            if r.status_code == 404:
+                return {"error": f"User '{username}' not found"}
+            
+            if r.status_code == 403:
+                return {"error": "GitHub API rate limit exceeded. Please try again later."}
+            
+            r.raise_for_status()
+            repos = r.json()
+            
+            if not repos:
+                return {"error": f"No public repositories found for '{username}'"}
+            
+            repo_name = repos[0]['name']
+            
+            # Get latest commit
+            c = await client.get(
+                f"https://api.github.com/repos/{username}/{repo_name}/commits",
+                params={"per_page": 1}
+            )
+            
+            commits = c.json() if c.status_code == 200 else []
+            
+            return {
+                "repo": repo_name,
+                "msg": commits[0]['commit']['message'] if commits else "N/A",
+                "date": repos[0]['pushed_at'],
+                "link": repos[0]['html_url']
+            }
+            
+        except Exception as e:
+            logger.error(f"GitHub API error: {e}")
+            return {"error": f"Error: {str(e)}"}
+
+# ============= MAIN MENU & START =============
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sets up the persistent keyboard menu."""
+    """Start command with menu"""
     user = update.effective_user
     
-    # Register user in database
-    await db.get_or_create_user(
-        user.id,
-        user.username,
-        user.first_name,
-        user.last_name
-    )
+    # Register user
+    await get_or_create_user(user.id, user.username, user.first_name, user.last_name)
     
+    # Create menu keyboard
     keyboard = [
         ["➕ Add Project", "📂 List Projects"],
         ["🖥️ Check GitHub", "⏳ Pomodoro"],
@@ -65,92 +252,99 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"🚀 **Welcome {user.first_name}!**\n\n"
-        "I'm your Project Manager Bot. Choose an option from the menu below.\n\n"
-        "📌 **Commands:**\n"
-        "/start - Restart the bot\n"
-        "/add - Add a new project\n"
-        "/list - View saved projects\n"
-        "/git - Check GitHub profile\n"
-        "/study - Start Pomodoro timer\n"
-        "/stop - Stop active timer\n"
-        "/cancel - Cancel current operation",
+        f"I'm your Project Manager Bot. Choose an option below.\n\n"
+        f"📌 **Commands:**\n"
+        f"/start - Show menu\n"
+        f"/add - Add project\n"
+        f"/list - View projects\n"
+        f"/edit - Edit project\n"
+        f"/delete - Delete project\n"
+        f"/git - Check GitHub\n"
+        f"/study - Start timer\n"
+        f"/stop - Stop timer\n"
+        f"/cancel - Cancel operation",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
-# --- Project Add Flow ---
+# ============= ADD PROJECT FLOW =============
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start project addition flow"""
-    await update.message.reply_text("📁 Enter the **Project Name**:")
+    """Start add project flow"""
+    await update.message.reply_text("📁 **Enter the Project Name:**", parse_mode='Markdown')
     return NAME
 
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get project name"""
-    context.user_data['n'] = update.message.text.strip()
-    await update.message.reply_text("🔗 Enter the **Project URL** (must include http:// or https://):")
+    context.user_data['name'] = update.message.text.strip()
+    await update.message.reply_text("🔗 **Enter the Project URL** (must include http:// or https://):", parse_mode='Markdown')
     return URL
 
 async def get_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get and validate project URL"""
+    """Get and validate URL"""
     url = update.message.text.strip()
     
     if not url.startswith(('http://', 'https://')):
-        await update.message.reply_text("❌ Invalid URL. Please include http:// or https://\n\nTry again:")
+        await update.message.reply_text("❌ Invalid URL! Please include http:// or https://\n\nTry again:")
         return URL
     
-    context.user_data['u'] = url
+    context.user_data['url'] = url
     
-    kb = [[InlineKeyboardButton("✅ Confirm", callback_data="c_y"), 
-           InlineKeyboardButton("❌ Cancel", callback_data="c_n")]]
+    # Confirmation buttons
+    keyboard = [[
+        InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes"),
+        InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")
+    ]]
     
     await update.message.reply_text(
         f"📝 **Confirm Project Details**\n\n"
-        f"**Name:** {escape_markdown(context.user_data['n'])}\n"
+        f"**Name:** {escape_markdown(context.user_data['name'])}\n"
         f"**URL:** {url}\n\n"
         f"Save this project?",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
     return CONFIRM
 
 async def confirm_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm and save project"""
-    q = update.callback_query
-    await q.answer()
+    """Save or cancel project"""
+    query = update.callback_query
+    await query.answer()
     
-    if q.data == "c_y":
+    if query.data == "confirm_yes":
         user_id = update.effective_user.id
-        success = await db.add_project(user_id, context.user_data['n'], context.user_data['u'])
+        success = await add_project(user_id, context.user_data['name'], context.user_data['url'])
         
         if success:
-            await q.edit_message_text(
+            await query.edit_message_text(
                 f"✅ **Project saved successfully!**\n\n"
-                f"📁 {escape_markdown(context.user_data['n'])}\n"
-                f"🔗 {context.user_data['u']}"
+                f"📁 {escape_markdown(context.user_data['name'])}\n"
+                f"🔗 {context.user_data['url']}",
+                parse_mode='Markdown'
             )
         else:
-            await q.edit_message_text("❌ Failed to save project. Please try again.")
+            await query.edit_message_text("❌ Failed to save project. Please try again.")
     else:
-        await q.edit_message_text("❌ Action cancelled.")
+        await query.edit_message_text("❌ Action cancelled.")
     
     return ConversationHandler.END
 
-# --- Project Listing ---
+# ============= LIST PROJECTS =============
 
 async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all saved projects"""
+    """List all projects"""
     user_id = update.effective_user.id
-    projects = await db.get_projects(user_id)
+    projects = await get_projects(user_id)
     
     if not projects:
-        return await update.message.reply_text("📭 Your project list is currently empty.")
+        await update.message.reply_text("📭 Your project list is currently empty.\n\nUse /add to add a project!")
+        return
     
     text = "📂 **Your Projects:**\n\n"
     for i, p in enumerate(projects, 1):
         safe_name = escape_markdown(p['name'])
-        created_date = p['created_at'].strftime("%Y-%m-%d %H:%M") if p['created_at'] else "Unknown date"
-        text += f"{i}. **[{safe_name}]({p['url']})**\n   📅 Added: {created_date}\n\n"
+        created = p['created_at'].strftime("%Y-%m-%d %H:%M") if p['created_at'] else "Unknown"
+        text += f"{i}. **[{safe_name}]({p['url']})**\n   📅 Added: {created}\n\n"
         
         if len(text) > 3500:
             await update.message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True)
@@ -159,139 +353,12 @@ async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text:
         await update.message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True)
 
-# --- GitHub Flow ---
-
-async def git_start_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point for GitHub lookup."""
-    sent_msg = await update.message.reply_text("👤 **GitHub Lookup**\n\nPlease type the username:")
-    context.user_data['git_msg_id'] = sent_msg.message_id
-    return GET_GIT_USER
-
-async def git_handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetches data and edits the prompt message."""
-    username = update.message.text.strip()
-    await update.message.delete()
-    
-    try:
-        data = await get_git_data(username)
-        
-        if isinstance(data, dict) and "error" in data:
-            text = f"❌ {data['error']}"
-        elif data:
-            dt = datetime.fromisoformat(data['date'].replace('Z', '+00:00')).strftime("%b %d, %Y at %H:%M")
-            text = (f"🖥️ **Latest Push: {username}**\n\n"
-                    f"📂 **Repo:** {escape_markdown(data['repo'])}\n"
-                    f"📝 **Message:** {escape_markdown(data['msg'])}\n"
-                    f"🕒 **Pushed:** {dt}\n"
-                    f"🔗 [View Repository]({data['link']})")
-        else:
-            text = f"❌ No public repos found for '{username}'."
-
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=context.user_data['git_msg_id'],
-            text=text,
-            parse_mode='Markdown',
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        logger.error(f"Git handler error: {e}")
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=context.user_data['git_msg_id'],
-            text="❌ An unexpected error occurred. Please try again later."
-        )
-    
-    return ConversationHandler.END
-
-# --- Pomodoro Timer ---
-
-async def study_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start Pomodoro timer"""
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    
-    if chat_id in active_timers:
-        await update.message.reply_text(
-            "⏰ A timer is already running!\nUse /stop to cancel it before starting a new one."
-        )
-        return
-    
-    timer_task = asyncio.create_task(run_pomodoro(update, context))
-    active_timers[chat_id] = timer_task
-    
-    await update.message.reply_text(
-        "⏳ **Pomodoro Started!**\n\n"
-        f"🎯 Work: 50 minutes\n"
-        "💡 Use /stop to cancel the timer\n"
-        "⏰ I'll notify you when it's break time!",
-        parse_mode='Markdown'
-    )
-
-async def run_pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run the actual Pomodoro timer"""
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    start_time = datetime.now()
-    
-    try:
-        # Work period (50 minutes)
-        for remaining in range(50 * 60, 0, -60):
-            if chat_id not in active_timers:
-                await db.add_pomodoro_session(user_id, start_time, datetime.now(), 50 * 60, False)
-                return
-            
-            if remaining % 300 == 0:
-                minutes = remaining // 60
-                await update.message.reply_text(f"⏰ {minutes} minutes remaining... Keep going!")
-            
-            await asyncio.sleep(60)
-        
-        if chat_id in active_timers:
-            await update.message.reply_text(
-                "🎉 **Great work!** Time for a break!\n\n"
-                "☕ Take 10 minutes to rest.\n"
-                "I'll remind you to start your next session.",
-                parse_mode='Markdown'
-            )
-            await db.add_pomodoro_session(user_id, start_time, datetime.now(), 50 * 60, True)
-            
-            # Break period (10 minutes)
-            for remaining in range(10 * 60, 0, -60):
-                if chat_id not in active_timers:
-                    return
-                await asyncio.sleep(60)
-            
-            if chat_id in active_timers:
-                await update.message.reply_text(
-                    "🎯 **Break's over!** Ready for another productive session?\n"
-                    "Use /study to start a new Pomodoro!",
-                    parse_mode='Markdown'
-                )
-                
-    except asyncio.CancelledError:
-        pass
-    finally:
-        active_timers.pop(chat_id, None)
-
-async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop the active timer"""
-    chat_id = update.effective_chat.id
-    
-    if chat_id in active_timers:
-        timer_task = active_timers[chat_id]
-        timer_task.cancel()
-        active_timers.pop(chat_id, None)
-        await update.message.reply_text("⏹️ **Timer stopped.** Ready for your next session!")
-    else:
-        await update.message.reply_text("No active timer running.")
-
-# --- Edit Project Flow ---
+# ============= EDIT PROJECT FLOW =============
 
 async def edit_project_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start project edit flow"""
+    """Start edit project flow"""
     user_id = update.effective_user.id
-    projects = await db.get_projects(user_id)
+    projects = await get_projects(user_id)
     
     if not projects:
         await update.message.reply_text("No projects to edit.")
@@ -309,33 +376,33 @@ async def edit_project_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return EDIT_PROJECT
 
 async def edit_project_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle project selection for editing"""
-    q = update.callback_query
-    await q.answer()
+    """Handle project selection"""
+    query = update.callback_query
+    await query.answer()
     
     try:
-        project_id = int(q.data.split('_')[1])
+        project_id = int(query.data.split('_')[1])
     except (IndexError, ValueError):
-        await q.edit_message_text("❌ Invalid selection.")
+        await query.edit_message_text("❌ Invalid selection.")
         return ConversationHandler.END
     
-    context.user_data['edit_project_id'] = project_id
+    context.user_data['edit_id'] = project_id
     
     user_id = update.effective_user.id
-    projects = await db.get_projects(user_id)
+    projects = await get_projects(user_id)
     project = next((p for p in projects if p['id'] == project_id), None)
     
     if not project:
-        await q.edit_message_text("❌ Project not found.")
+        await query.edit_message_text("❌ Project not found.")
         return ConversationHandler.END
     
     keyboard = [
-        [InlineKeyboardButton("📝 Edit Name", callback_data="edit_field_name")],
-        [InlineKeyboardButton("🔗 Edit URL", callback_data="edit_field_url")],
+        [InlineKeyboardButton("📝 Edit Name", callback_data="edit_name")],
+        [InlineKeyboardButton("🔗 Edit URL", callback_data="edit_url")],
         [InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")]
     ]
     
-    await q.edit_message_text(
+    await query.edit_message_text(
         f"✏️ **Editing Project:**\n\n"
         f"**Name:** {escape_markdown(project['name'])}\n"
         f"**URL:** {project['url']}\n\n"
@@ -347,28 +414,26 @@ async def edit_project_select(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def edit_project_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle edit field selection"""
-    q = update.callback_query
-    await q.answer()
+    query = update.callback_query
+    await query.answer()
     
-    action = q.data
-    
-    if action == "edit_field_name":
-        await q.edit_message_text("📝 Enter the new project name:")
+    if query.data == "edit_name":
+        await query.edit_message_text("📝 **Enter the new project name:**", parse_mode='Markdown')
         context.user_data['edit_field'] = 'name'
         return EDIT_FIELD
-    elif action == "edit_field_url":
-        await q.edit_message_text("🔗 Enter the new project URL (must include http:// or https://):")
+    elif query.data == "edit_url":
+        await query.edit_message_text("🔗 **Enter the new URL** (with http:// or https://):", parse_mode='Markdown')
         context.user_data['edit_field'] = 'url'
         return EDIT_FIELD
     else:
-        await q.edit_message_text("❌ Edit cancelled.")
+        await query.edit_message_text("❌ Edit cancelled.")
         return ConversationHandler.END
 
 async def edit_project_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save edited project"""
     new_value = update.message.text.strip()
     field = context.user_data.get('edit_field')
-    project_id = context.user_data.get('edit_project_id')
+    project_id = context.user_data.get('edit_id')
     user_id = update.effective_user.id
     
     if not field or not project_id:
@@ -376,13 +441,13 @@ async def edit_project_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     
     if field == 'url' and not new_value.startswith(('http://', 'https://')):
-        await update.message.reply_text("❌ Invalid URL. Please include http:// or https://\n\nTry again:")
+        await update.message.reply_text("❌ Invalid URL. Include http:// or https://\n\nTry again:")
         return EDIT_FIELD
     
     if field == 'name':
-        success = await db.update_project(project_id, user_id, name=new_value)
+        success = await update_project(project_id, user_id, name=new_value)
     else:
-        success = await db.update_project(project_id, user_id, url=new_value)
+        success = await update_project(project_id, user_id, url=new_value)
     
     if success:
         await update.message.reply_text(f"✅ Project {field} updated successfully!")
@@ -391,12 +456,12 @@ async def edit_project_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
-# --- Delete Project Flow ---
+# ============= DELETE PROJECT FLOW =============
 
 async def delete_project_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start project deletion flow"""
+    """Start delete project flow"""
     user_id = update.effective_user.id
-    projects = await db.get_projects(user_id)
+    projects = await get_projects(user_id)
     
     if not projects:
         await update.message.reply_text("No projects to delete.")
@@ -414,76 +479,183 @@ async def delete_project_start(update: Update, context: ContextTypes.DEFAULT_TYP
     return DELETE_PROJECT_CONFIRM
 
 async def delete_project_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm project deletion"""
-    q = update.callback_query
-    await q.answer()
+    """Confirm deletion"""
+    query = update.callback_query
+    await query.answer()
     
     try:
-        project_id = int(q.data.split('_')[1])
+        project_id = int(query.data.split('_')[1])
     except (IndexError, ValueError):
-        await q.edit_message_text("❌ Invalid selection.")
+        await query.edit_message_text("❌ Invalid selection.")
         return ConversationHandler.END
     
-    context.user_data['delete_project_id'] = project_id
-    
-    user_id = update.effective_user.id
-    projects = await db.get_projects(user_id)
-    project = next((p for p in projects if p['id'] == project_id), None)
-    
-    if not project:
-        await q.edit_message_text("❌ Project not found.")
-        return ConversationHandler.END
+    context.user_data['delete_id'] = project_id
     
     keyboard = [
         [InlineKeyboardButton("✅ Yes, Delete", callback_data="del_yes")],
         [InlineKeyboardButton("❌ No, Cancel", callback_data="del_no")]
     ]
     
-    await q.edit_message_text(
-        f"⚠️ **Delete Project**\n\n"
-        f"Are you sure you want to delete '{escape_markdown(project['name'])}'?\n\n"
-        f"This action cannot be undone.",
+    await query.edit_message_text(
+        "⚠️ **Are you sure?**\n\nThis action cannot be undone.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
     return DELETE_PROJECT_CONFIRM
 
 async def delete_project_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Execute project deletion"""
-    q = update.callback_query
-    await q.answer()
+    """Execute deletion"""
+    query = update.callback_query
+    await query.answer()
     
-    if q.data == "del_yes":
-        project_id = context.user_data.get('delete_project_id')
+    if query.data == "del_yes":
+        project_id = context.user_data.get('delete_id')
         user_id = update.effective_user.id
         
         if not project_id:
-            await q.edit_message_text("❌ Session expired. Please start over.")
+            await query.edit_message_text("❌ Session expired. Please start over.")
             return ConversationHandler.END
         
-        success = await db.delete_project(project_id, user_id)
+        success = await delete_project(project_id, user_id)
         
         if success:
-            await q.edit_message_text("✅ Project deleted successfully!")
+            await query.edit_message_text("✅ Project deleted successfully!")
         else:
-            await q.edit_message_text("❌ Failed to delete project.")
+            await query.edit_message_text("❌ Failed to delete project.")
     else:
-        await q.edit_message_text("❌ Deletion cancelled.")
+        await query.edit_message_text("❌ Deletion cancelled.")
     
     return ConversationHandler.END
 
-# --- Cancel and Error Handling ---
+# ============= GITHUB FLOW =============
+
+async def git_start_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start GitHub lookup"""
+    sent_msg = await update.message.reply_text("👤 **GitHub Lookup**\n\nPlease type the username:", parse_mode='Markdown')
+    context.user_data['git_msg_id'] = sent_msg.message_id
+    return GET_GIT_USER
+
+async def git_handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle GitHub username and fetch data"""
+    username = update.message.text.strip()
+    await update.message.delete()  # Delete user's message
+    
+    data = await get_git_data(username)
+    
+    if isinstance(data, dict) and "error" in data:
+        text = f"❌ {data['error']}"
+    elif data:
+        dt = datetime.fromisoformat(data['date'].replace('Z', '+00:00')).strftime("%b %d, %Y at %H:%M")
+        text = (f"🖥️ **Latest Push: {username}**\n\n"
+                f"📂 **Repo:** {escape_markdown(data['repo'])}\n"
+                f"📝 **Message:** {escape_markdown(data['msg'][:100])}\n"
+                f"🕒 **Pushed:** {dt}\n"
+                f"🔗 [View Repository]({data['link']})")
+    else:
+        text = f"❌ No public repos found for '{username}'"
+    
+    await context.bot.edit_message_text(
+        chat_id=update.effective_chat.id,
+        message_id=context.user_data['git_msg_id'],
+        text=text,
+        parse_mode='Markdown',
+        disable_web_page_preview=True
+    )
+    
+    return ConversationHandler.END
+
+# ============= POMODORO TIMER =============
+
+async def study_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start Pomodoro timer"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    if chat_id in active_timers:
+        await update.message.reply_text(
+            "⏰ A timer is already running!\nUse /stop to cancel it before starting a new one."
+        )
+        return
+    
+    # Start timer in background
+    timer_task = asyncio.create_task(run_pomodoro(update, context))
+    active_timers[chat_id] = timer_task
+    
+    await update.message.reply_text(
+        "⏳ **Pomodoro Started!**\n\n"
+        f"🎯 Work: 50 minutes\n"
+        "💡 Use /stop to cancel the timer\n"
+        "⏰ I'll notify you when it's break time!",
+        parse_mode='Markdown'
+    )
+
+async def run_pomodoro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run the Pomodoro timer"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    start_time = datetime.now()
+    
+    try:
+        # Work period (50 minutes = 3000 seconds)
+        for remaining in range(3000, 0, -60):
+            if chat_id not in active_timers:
+                await add_pomodoro_session(user_id, start_time, datetime.now(), 3000, False)
+                return
+            
+            if remaining % 300 == 0:  # Every 5 minutes
+                minutes = remaining // 60
+                await update.message.reply_text(f"⏰ {minutes} minutes remaining... Keep going!")
+            
+            await asyncio.sleep(60)
+        
+        if chat_id in active_timers:
+            await update.message.reply_text(
+                "🎉 **Great work!** Time for a break!\n\n"
+                "☕ Take 10 minutes to rest.\n"
+                "I'll remind you to start your next session.",
+                parse_mode='Markdown'
+            )
+            await add_pomodoro_session(user_id, start_time, datetime.now(), 3000, True)
+            
+            # Break period (10 minutes = 600 seconds)
+            for remaining in range(600, 0, -60):
+                if chat_id not in active_timers:
+                    return
+                await asyncio.sleep(60)
+            
+            if chat_id in active_timers:
+                await update.message.reply_text(
+                    "🎯 **Break's over!** Ready for another productive session?\n"
+                    "Use /study to start a new Pomodoro!",
+                    parse_mode='Markdown'
+                )
+                
+    except asyncio.CancelledError:
+        pass
+    finally:
+        active_timers.pop(chat_id, None)
+
+async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop active timer"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id in active_timers:
+        active_timers[chat_id].cancel()
+        active_timers.pop(chat_id, None)
+        await update.message.reply_text("⏹️ **Timer stopped.** Ready for your next session!")
+    else:
+        await update.message.reply_text("No active timer running.")
+
+# ============= CANCEL & ERROR HANDLING =============
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel current operation"""
-    user_id = update.effective_user.id
-    await db.clear_session(user_id)
     context.user_data.clear()
-    await update.message.reply_text("❌ **Operation cancelled.** Back to main menu.")
+    await update.message.reply_text("❌ **Operation cancelled.** Back to main menu.", parse_mode='Markdown')
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors and notify user"""
+    """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
     
     try:
@@ -494,37 +666,25 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# --- Application Startup ---
+# ============= MAIN =============
 
-async def post_init(application):
-    """Initialize database and register commands"""
-    await db.connect()
-    await application.bot.set_my_commands([
-        BotCommand("start", "Restart the bot and show menu"),
-        BotCommand("add", "Add a new project"),
-        BotCommand("list", "View saved projects"),
-        BotCommand("edit", "Edit a project"),
-        BotCommand("delete", "Delete a project"),
-        BotCommand("git", "Check GitHub profile"),
-        BotCommand("study", "Start Pomodoro timer"),
-        BotCommand("stop", "Stop active timer"),
-        BotCommand("cancel", "Cancel current operation")
-    ])
-    logger.info("Bot started successfully with database")
-
-async def shutdown(application):
-    """Cleanup on shutdown"""
-    await db.close()
-    logger.info("Bot shutdown complete")
-
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).post_shutdown(shutdown).build()
+async def main():
+    """Start the bot"""
+    # Initialize database
+    if not await init_db():
+        logger.error("Failed to connect to database. Exiting...")
+        return
     
+    # Create application
+    app = ApplicationBuilder().token(TOKEN).build()
+    
+    # Error handler
     app.add_error_handler(error_handler)
     
+    # Filter to block commands during conversation
     block_filter = filters.COMMAND & ~filters.Regex('^/cancel$')
     
-    # Conversation handlers
+    # Conversation: Add Project
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler("add", add_start),
@@ -535,13 +695,14 @@ if __name__ == '__main__':
                    MessageHandler(block_filter, cancel)],
             URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_url), 
                   MessageHandler(block_filter, cancel)],
-            CONFIRM: [CallbackQueryHandler(confirm_add, pattern="^c_"), 
+            CONFIRM: [CallbackQueryHandler(confirm_add, pattern="^confirm_"), 
                       MessageHandler(block_filter, cancel)]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True
     )
     
+    # Conversation: Edit Project
     edit_conv = ConversationHandler(
         entry_points=[
             CommandHandler("edit", edit_project_start),
@@ -550,7 +711,7 @@ if __name__ == '__main__':
         states={
             EDIT_PROJECT: [
                 CallbackQueryHandler(edit_project_select, pattern="^edit_\\d+$"),
-                CallbackQueryHandler(edit_project_field, pattern="^edit_field_"),
+                CallbackQueryHandler(edit_project_field, pattern="^edit_"),
                 CallbackQueryHandler(edit_project_field, pattern="^edit_cancel$")
             ],
             EDIT_FIELD: [
@@ -562,6 +723,7 @@ if __name__ == '__main__':
         allow_reentry=True
     )
     
+    # Conversation: Delete Project
     delete_conv = ConversationHandler(
         entry_points=[
             CommandHandler("delete", delete_project_start),
@@ -578,6 +740,7 @@ if __name__ == '__main__':
         allow_reentry=True
     )
     
+    # Conversation: GitHub Check
     git_conv = ConversationHandler(
         entry_points=[
             CommandHandler("git", git_start_flow),
@@ -591,17 +754,44 @@ if __name__ == '__main__':
         allow_reentry=True
     )
     
-    # Add handlers
+    # Add all conversation handlers
     app.add_handler(add_conv)
     app.add_handler(edit_conv)
     app.add_handler(delete_conv)
     app.add_handler(git_conv)
+    
+    # Command handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("list", list_projects))
     app.add_handler(CommandHandler("study", study_cmd))
     app.add_handler(CommandHandler("stop", stop_timer))
+    
+    # Menu button handlers
     app.add_handler(MessageHandler(filters.Regex("^📂 List Projects$"), list_projects))
     app.add_handler(MessageHandler(filters.Regex("^⏳ Pomodoro$"), study_cmd))
     
-    logger.info("Bot is up and running with database...")
-    app.run_polling()
+    # Set bot commands
+    await app.bot.set_my_commands([
+        BotCommand("start", "Show menu"),
+        BotCommand("add", "Add a project"),
+        BotCommand("list", "List projects"),
+        BotCommand("edit", "Edit a project"),
+        BotCommand("delete", "Delete a project"),
+        BotCommand("git", "Check GitHub profile"),
+        BotCommand("study", "Start Pomodoro timer"),
+        BotCommand("stop", "Stop timer"),
+        BotCommand("cancel", "Cancel operation")
+    ])
+    
+    logger.info("🚀 Bot is running with full features!")
+    
+    # Start bot
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    
+    # Keep running
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
